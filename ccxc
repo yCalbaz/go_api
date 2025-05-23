@@ -1,0 +1,140 @@
+package main
+
+import (
+	"fmt"
+	"log"
+	"os"
+
+	"github.com/gofiber/fiber/v2"
+	"github.com/joho/godotenv"
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
+)
+
+type Stock struct {
+	ProductSku   string `json:"product_sku"`
+	StoreId      uint   `json:"store_id"`
+	ProductPiece int    `json:"product_piece"`
+}
+
+type Store struct {
+	ID            uint `json:"id"`
+	StorePriority int  `json:"store_priority"`
+}
+
+var DB *gorm.DB
+
+func ConnectDatabase() {
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatal("Env dosyası yüklenemedi!")
+	}
+
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=True&loc=Local",
+		os.Getenv("DB_USERNAME"),
+		os.Getenv("DB_PASSWORD"),
+		os.Getenv("DB_HOST"),
+		os.Getenv("DB_PORT"),
+		os.Getenv("DB_DATABASE"),
+	)
+
+	database, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	if err != nil {
+		log.Fatal("Veritabanına bağlanılamadı!")
+	}
+
+	DB = database
+}
+
+func checkStock(productSku string) (map[uint]int, error) {
+	var stockInfo []struct {
+		StoreId      uint `json:"store_id"`
+		ProductPiece int  `json:"product_piece"`
+	}
+	err := DB.Table("stocks").
+		Where("product_sku = ?", productSku).
+		Select("store_id, SUM(product_piece) as product_piece").
+		Group("store_id").
+		Scan(&stockInfo).Error
+
+	if err != nil {
+		return nil, err
+	}
+
+	stockMap := make(map[uint]int)
+	for _, stock := range stockInfo {
+		stockMap[stock.StoreId] = stock.ProductPiece
+	}
+
+	return stockMap, nil
+}
+
+func getPreferredStore(productSku string) (uint, error) {
+	var store Store
+	err := DB.Table("stocks").
+		Select("stores.id, stores.store_priority").
+		Joins("JOIN stores ON stocks.store_id = stores.id").
+		Where("stocks.product_sku = ? AND stocks.product_piece > 0", productSku).
+		Order("stores.store_priority ASC").
+		First(&store).Error
+
+	if err != nil {
+		return 0, err
+	}
+
+	return store.ID, nil
+}
+
+func assignStockToPreferredStore(productSku string, quantity int) error {
+	storeId, err := getPreferredStore(productSku)
+	if err != nil {
+		return err
+	}
+
+	// Check if the store exists in the stocks table and update the stock
+	var stock Stock
+	err = DB.Table("stocks").
+		Where("product_sku = ? AND store_id = ?", productSku, storeId).
+		First(&stock).Error
+
+	if err != nil {
+		// If the stock doesn't exist, create a new entry for this store
+		stock = Stock{
+			ProductSku:   productSku,
+			StoreId:      storeId,
+			ProductPiece: quantity,
+		}
+		err = DB.Table("stocks").Create(&stock).Error
+	} else {
+		// If the stock exists, update the quantity
+		stock.ProductPiece += quantity
+		err = DB.Table("stocks").Save(&stock).Error
+	}
+
+	return err
+}
+
+func main() {
+	ConnectDatabase()
+	app := fiber.New()
+
+	app.Post("/stock/assign", func(c *fiber.Ctx) error {
+		var requestBody struct {
+			ProductSku string `json:"product_sku"`
+			Quantity   int    `json:"quantity"`
+		}
+
+		if err := c.BodyParser(&requestBody); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Geçersiz veri"})
+		}
+
+		err := assignStockToPreferredStore(requestBody.ProductSku, requestBody.Quantity)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Stok ataması başarısız"})
+		}
+
+		return c.JSON(fiber.Map{"message": "Stok başarıyla öncelikli depoya atandı"})
+	})
+
+	log.Fatal(app.Listen(":3000"))
+}
